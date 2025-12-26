@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+############################################
+# CONFIG / DEFAULTS
+############################################
+
+GONKA_NODE_NAME="${GONKA_NODE_NAME:-}"
+GONKA_KEY_PASSWORD="${GONKA_KEY_PASSWORD:-}"
+
+GONKA_API_PORT="${GONKA_API_PORT:-8000}"
+GONKA_P2P_PORT="${GONKA_P2P_PORT:-5000}"
+HF_CACHE_DIR="${HF_CACHE_DIR:-/opt/hf-cache}"
+GONKA_INSTALL_DIR="${GONKA_INSTALL_DIR:-/opt/gonka}"
+
+STATE_FILE="${GONKA_INSTALL_DIR}/.install_state"
+
+############################################
+# VALIDATION
+############################################
+
+if [[ -z "$GONKA_NODE_NAME" || -z "$GONKA_KEY_PASSWORD" ]]; then
+  echo "❌ Required env vars missing:"
+  echo "   - GONKA_NODE_NAME"
+  echo "   - GONKA_KEY_PASSWORD"
+  exit 1
+fi
+
+############################################
+# UTILITIES
+############################################
+
+log() {
+  echo -e "\n▶ $1"
+}
+
+mark_done() {
+  echo "$1=DONE" >> "$STATE_FILE"
+}
+
+is_done() {
+  grep -q "^$1=DONE$" "$STATE_FILE" 2>/dev/null
+}
+
+get_public_ip() {
+  curl -s https://api.ipify.org
+}
+
+############################################
+# STEP 1 — SYSTEM UPDATE
+############################################
+
+if ! is_done SYSTEM_UPDATE; then
+  log "System update"
+  apt update && apt upgrade -y
+  apt install -y curl git vim ca-certificates gnupg lsb-release
+  mark_done SYSTEM_UPDATE
+fi
+
+############################################
+# STEP 2 — NVIDIA DRIVER CHECK
+############################################
+
+if ! is_done NVIDIA_CHECK; then
+  log "Checking NVIDIA GPU"
+  if ! command -v nvidia-smi &>/dev/null; then
+    echo "❌ NVIDIA driver not found. Install NVIDIA driver first."
+    exit 1
+  fi
+  nvidia-smi
+  mark_done NVIDIA_CHECK
+fi
+
+############################################
+# STEP 3 — DOCKER INSTALL
+############################################
+
+if ! is_done DOCKER_INSTALL; then
+  log "Installing Docker"
+  curl -fsSL https://get.docker.com | sh
+  usermod -aG docker "$USER"
+  systemctl enable docker
+  systemctl start docker
+  mark_done DOCKER_INSTALL
+fi
+
+############################################
+# STEP 4 — NVIDIA DOCKER TOOLKIT
+############################################
+
+if ! is_done NVIDIA_DOCKER; then
+  log "Installing NVIDIA Docker Toolkit"
+  distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+  curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
+  curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list \
+    | tee /etc/apt/sources.list.d/nvidia-docker.list
+  apt update
+  apt install -y nvidia-docker2
+  systemctl restart docker
+  mark_done NVIDIA_DOCKER
+fi
+
+############################################
+# STEP 5 — DIRECTORY SETUP
+############################################
+
+if ! is_done DIR_SETUP; then
+  log "Creating directories"
+  mkdir -p "$HF_CACHE_DIR"
+  mkdir -p "$GONKA_INSTALL_DIR"
+  mark_done DIR_SETUP
+fi
+
+############################################
+# STEP 6 — CLONE GONKA
+############################################
+
+if ! is_done GONKA_CLONE; then
+  log "Cloning Gonka repo"
+  cd "$GONKA_INSTALL_DIR"
+  if [[ ! -d gonka ]]; then
+    git clone https://github.com/gonka-ai/gonka.git
+  fi
+  mark_done GONKA_CLONE
+fi
+
+############################################
+# STEP 7 — CONFIG GENERATION
+############################################
+
+if ! is_done CONFIG_GEN; then
+  log "Generating config.env"
+
+  PUBLIC_IP=$(get_public_ip)
+
+  cd "$GONKA_INSTALL_DIR/gonka/deploy/join"
+  cp -f config.env.template config.env
+
+  cat <<EOF > config.env
+KEY_NAME=${GONKA_NODE_NAME}
+KEYRING_PASSWORD=${GONKA_KEY_PASSWORD}
+API_PORT=${GONKA_API_PORT}
+PUBLIC_URL=http://${PUBLIC_IP}:${GONKA_API_PORT}
+P2P_EXTERNAL_ADDRESS=http://${PUBLIC_IP}:${GONKA_P2P_PORT}
+HF_HOME=${HF_CACHE_DIR}
+EOF
+
+  mark_done CONFIG_GEN
+fi
+
+############################################
+# STEP 8 — DOCKER PULL
+############################################
+
+if ! is_done DOCKER_PULL; then
+  log "Pulling docker images"
+  cd "$GONKA_INSTALL_DIR/gonka/deploy/join"
+  docker compose -f docker-compose.yml -f docker-compose.mlnode.yml pull
+  mark_done DOCKER_PULL
+fi
